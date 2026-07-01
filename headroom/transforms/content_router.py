@@ -197,6 +197,32 @@ def _detect_content(content: str) -> DetectionResult:
     )
 
 
+# ── P0: Detection result cache ──────────────────────────────────────────
+# Avoids re-detecting identical content across requests (system prompts,
+# repeated tool outputs). LRU with blake2b key (no PYTHONHASHSEED issues).
+import hashlib
+from collections import OrderedDict as _OrderedDict
+
+_detection_cache: _OrderedDict[str, DetectionResult] = _OrderedDict()
+_DETECTION_CACHE_MAX = 2000
+
+
+def _detect_content_cached(content: str) -> DetectionResult:
+    """Cache-aware wrapper around _detect_content()."""
+    key = hashlib.blake2b(
+        content.encode("utf-8", errors="replace"), digest_size=16
+    ).hexdigest()
+    cached = _detection_cache.get(key)
+    if cached is not None:
+        _detection_cache.move_to_end(key)
+        return cached
+    result = _detect_content(content)
+    _detection_cache[key] = result
+    if len(_detection_cache) > _DETECTION_CACHE_MAX:
+        _detection_cache.popitem(last=False)
+    return result
+
+
 def _create_content_signature(
     content_type: str,
     content: str,
@@ -1116,11 +1142,11 @@ class ContentRouter(Transform):
             logger.debug("TOIN recording failed (non-fatal): %s", e)
 
     def _timed_compress(
-        self, content: str, context: str, bias: float
+        self, content: str, context: str, bias: float, detection: Any = None
     ) -> tuple[RouterCompressionResult, float]:
         """Compress with wall-clock timing.  Used by parallel executor."""
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
+        result = self.compress(content, context=context, bias=bias, detection=detection)
         return result, (time.perf_counter() - t0) * 1000
 
     def compress(
@@ -1129,6 +1155,7 @@ class ContentRouter(Transform):
         context: str = "",
         question: str | None = None,
         bias: float = 1.0,
+        detection: Any = None,
     ) -> RouterCompressionResult:
         """Compress content using optimal strategy based on content detection.
 
@@ -1184,7 +1211,7 @@ class ContentRouter(Transform):
                 strategy = CompressionStrategy.KOMPRESS
             else:
                 mixed = is_mixed_content(content)
-                detection = _detect_content(content)
+                detection = detection if detection is not None else _detect_content_cached(content)
                 strategy = self._determine_strategy(content)
             if debug_enabled:
                 _log_router_debug(
@@ -1290,7 +1317,7 @@ class ContentRouter(Transform):
             return CompressionStrategy.MIXED
 
         # 2. Detect content type from content itself
-        detection = _detect_content(content)
+        detection = _detect_content_cached(content)
         return self._strategy_from_detection(detection)
 
     def _strategy_from_detection(self, detection: Any) -> CompressionStrategy:
@@ -1358,44 +1385,60 @@ class ContentRouter(Transform):
                 strategy_used=CompressionStrategy.PASSTHROUGH,
             )
 
-        compressed_sections: list[str] = []
-        routing_log: list[RoutingDecision] = []
+        compressed_sections: list[str | None] = [None] * len(sections)
+        routing_log: list[RoutingDecision | None] = [None] * len(sections)
 
-        for i, section in enumerate(sections):
-            # Get strategy for this section
+        def _compress_one_section(idx: int, section: ContentSection) -> tuple[int, str, int, int, CompressionStrategy]:
+            """Compress a single mixed section. Thread-safe (pure function + stateless sub-compressors)."""
             strategy = self._strategy_from_detection_type(section.content_type)
-
-            # Compress section
             original_tokens = len(section.content.split())
-            compressed_content, compressed_tokens, _section_chain = self._apply_strategy_to_content(
-                section.content,
-                strategy,
-                context,
-                section.language,
-                question,
-                bias=bias,
-            )
-
-            # Preserve code fence markers
+            try:
+                compressed_content, compressed_tokens, _chain = self._apply_strategy_to_content(
+                    section.content, strategy, context, section.language, question, bias=bias,
+                )
+            except Exception as e:
+                logger.warning("Mixed section %d compress failed: %s — passthrough", idx, e)
+                compressed_content = section.content
+                compressed_tokens = original_tokens
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
+            return idx, compressed_content, original_tokens, compressed_tokens, strategy
 
-            compressed_sections.append(compressed_content)
-            routing_log.append(
-                RoutingDecision(
-                    content_type=section.content_type,
-                    strategy=strategy,
-                    original_tokens=original_tokens,
-                    compressed_tokens=compressed_tokens,
-                    section_index=i,
+        # P2: Parallel section compression — sections are independent, no ordering dependency.
+        # Use a small thread pool (capped at 4) to avoid thread explosion when nested
+        # inside Pass 2's ThreadPoolExecutor. ONNX/GPU inference releases the GIL,
+        # so parallel sections get real speedup on ML-bound work.
+        if len(sections) <= 1:
+            # Single section — no need for a thread pool
+            for i, section in enumerate(sections):
+                idx, cc, ot, ct, strat = _compress_one_section(i, section)
+                compressed_sections[idx] = cc
+                routing_log[idx] = RoutingDecision(
+                    content_type=section.content_type, strategy=strat,
+                    original_tokens=ot, compressed_tokens=ct, section_index=idx,
                 )
-            )
+        else:
+            max_section_workers = min(len(sections), 4)
+            with ThreadPoolExecutor(
+                max_workers=max_section_workers, thread_name_prefix="mixed-section"
+            ) as pool:
+                futures = [
+                    pool.submit(_compress_one_section, i, section)
+                    for i, section in enumerate(sections)
+                ]
+                for f in futures:
+                    idx, cc, ot, ct, strat = f.result()
+                    routing_log[idx] = RoutingDecision(
+                        content_type=sections[idx].content_type, strategy=strat,
+                        original_tokens=ot, compressed_tokens=ct, section_index=idx,
+                    )
+                    compressed_sections[idx] = cc
 
         return RouterCompressionResult(
-            compressed="\n\n".join(compressed_sections),
+            compressed="\n\n".join(s for s in compressed_sections if s is not None),
             original=content,
             strategy_used=CompressionStrategy.MIXED,
-            routing_log=routing_log,
+            routing_log=[r for r in routing_log if r is not None],
             sections_processed=len(sections),
         )
 
@@ -2621,8 +2664,10 @@ class ContentRouter(Transform):
                     ttl = _net_cost_cache_ttl_seconds()
                     netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
 
-        # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, int, bool]
+        # Tasks: list of (slot_index, content, context, bias, content_key,
+        #                   enforce_reversibility, detection)
+        # detection: Pass 1 result to avoid re-detecting in compress() (P1)
+        _PendingTask = tuple[int, str, str, float, int, bool, Any]
         pending_tasks: list[_PendingTask] = []
 
         # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
@@ -2755,7 +2800,7 @@ class ContentRouter(Transform):
             # full router chain.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
             detection = (
-                _regex_detect_content_type(content) if force_kompress else _detect_content(content)
+                _regex_detect_content_type(content) if force_kompress else _detect_content_cached(content)
             )
             is_code = detection.content_type == ContentType.SOURCE_CODE
 
@@ -2851,7 +2896,7 @@ class ContentRouter(Transform):
             route_counts.setdefault("cache_miss", 0)
             route_counts["cache_miss"] += 1
             pending_tasks.append(
-                (i, content, context, msg_bias, content_key, enforce_reversibility)
+                (i, content, context, msg_bias, content_key, enforce_reversibility, detection)
             )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
@@ -2864,17 +2909,17 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
                     t0 = time.perf_counter()
-                    r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                    r = self.compress(task_content, context=task_ctx, bias=task_bias, detection=task_detection)
                     task_results.append((r, (time.perf_counter() - t0) * 1000))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                    for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
                         futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias, task_detection)
                         )
                     task_results = [f.result() for f in futures]
 
