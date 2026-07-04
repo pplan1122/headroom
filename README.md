@@ -12,11 +12,12 @@
 | 1 | CJK 中文保护 | `sitecustomize.py` | Kompress (ModernBERT 仅英文) 前用占位符替换 CJK，压缩后恢复 |
 | 2 | 单实例双路由 | `sitecustomize.py` | 通过 `x-headroom-base-url` 请求头路由到多个上游 API |
 | 3 | Kompress GPU 加速 | systemd env | `HEADROOM_KOMPRESS_BACKEND=pytorch` + PyTorch 2.5.1+cu124 |
-| 4 | 嵌入器 GPU | systemd env | `HEADROOM_EMBEDDER_RUNTIME=pytorch_cuda` |
-| 5 | 检测缓存 (P0) | `content_router.py` | `_detect_content_cached()` blake2b LRU 2000 |
-| 6 | 去双重检测 (P1) | `content_router.py` | Pass 1 检测结果传入 `compress()` |
-| 7 | Mixed 段级并行 (P2) | `content_router.py` | `_compress_mixed()` 串行循环 → 线程池 |
-| 8 | 管线 worker 调优 | systemd env | `HEADROOM_COMPRESS_WORKERS=8` |
+| 4 | 压缩缓存内存泄漏修复 (P0) | `sitecustomize.py` | `_stable_hashes`/`_first_seen` 上限 5k/10k，`ContentRouter._results` 上限 10k |
+| 5 | 移除 `compute_frozen_count=0` (P0a) | `sitecustomize.py` | 恢复 prefix cache 保护；原补丁导致上游 cache 每轮全 bust |
+| 6 | 管线 worker 调优 (P1) | systemd env | `HEADROOM_COMPRESS_WORKERS=8` → `=4` |
+| 7 | 检测缓存 (P0) | `content_router.py` | `_detect_content_cached()` blake2b LRU 2000 |
+| 8 | 去双重检测 (P1) | `content_router.py` | Pass 1 检测结果传入 `compress()` |
+| 9 | Mixed 段级并行 (P2) | `content_router.py` | `_compress_mixed()` 串行循环 → 线程池 |
 
 ## GPU 配置
 
